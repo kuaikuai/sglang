@@ -425,28 +425,39 @@ impl Router {
     }
 
     // TODO: return Result<String, String> instead of panicking
-    fn select_generate_worker(&self, body: &Bytes, route: &str) -> String {
+    fn select_generate_worker(&self, body: &Bytes, route: &str) -> Result<String, String> {
         let text = self.get_text_from_request(&body, route);
-
         let worker_url = match self {
             Router::RoundRobin {
                 worker_urls,
                 current_index,
                 ..
             } => {
+                let urls = worker_urls.read().map_err(|e| format!("Failed to read worker URLs: {}", e))?;
+                if urls.is_empty() {
+                    return Err("No worker URLs available".to_string());
+                }
+
                 let idx = current_index
                     .fetch_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
-                        |x| Some((x + 1) % worker_urls.read().unwrap().len()),
+                        |x| Some((x + 1) % urls.len()),
                     )
-                    .unwrap();
-                worker_urls.read().unwrap()[idx].clone()
+                    .map_err(|e| format!("Failed to update current index: {}", e))?;
+
+                Ok(urls[idx].clone())
             }
 
-            Router::Random { worker_urls, .. } => worker_urls.read().unwrap()
-                [rand::random::<usize>() % worker_urls.read().unwrap().len()]
-            .clone(),
+            Router::Random { worker_urls, .. } => {
+                let urls = worker_urls.read().map_err(|e| format!("Failed to read worker URLs: {}", e))?;
+                if urls.is_empty() {
+                    return Err("No worker URLs available".to_string());
+                }
+
+                let idx = rand::random::<usize>() % urls.len();
+                Ok(urls[idx].clone())
+            }
 
             Router::CacheAware {
                 worker_urls,
@@ -461,7 +472,7 @@ impl Router {
                 // TODO: delay scheduling if cache hit rate is high because it may cause imbalance. prioritize low hit rate ones
 
                 let tree = tree.lock().unwrap();
-                let mut running_queue = running_queue.lock().unwrap();
+                let running_queue = running_queue.lock().unwrap();
 
                 // Get current load statistics
                 let max_load = *running_queue.values().max().unwrap_or(&0);
@@ -471,16 +482,18 @@ impl Router {
                 // 1. (max - min) > abs_threshold AND
                 // 2. max > rel_threshold * min
                 let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
-                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold);
+                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold) || ( max_load > 0 && min_load == 0 );
 
                 let selected_url = if is_imbalanced {
-                    // Log load balancing trigger and current queue state
-                    info!(
-                        "Load balancing triggered due to workload imbalance:\n\
-                        Max load: {}, Min load: {}\n\
-                        Current running queue: {:?}",
-                        max_load, min_load, running_queue
-                    );
+                    if !( max_load > 0 && min_load == 0 ) {
+                        // Log load balancing trigger and current queue state
+                        info!(
+                            "Load balancing triggered due to workload imbalance:\n\
+                            Max load: {}, Min load: {}\n\
+                            Current running queue: {:?}",
+                            max_load, min_load, running_queue
+                        );
+                    }
 
                     // Use shortest queue routing when load is imbalanced
                     running_queue
@@ -502,16 +515,15 @@ impl Router {
                 };
 
                 // Update queues and tree
-                *running_queue.get_mut(&selected_url).unwrap() += 1;
-
-                *processed_queue
-                    .lock()
-                    .unwrap()
-                    .get_mut(&selected_url)
-                    .unwrap() += 1;
+                let  mut processed_queue = processed_queue.lock().unwrap();
+                if let Some(count) = processed_queue.get_mut(&selected_url) {
+                    *count += 1;
+                } else {
+                     return Err(format!("Key {} not found in processed_queue", selected_url));
+                }
                 tree.insert(&text, &selected_url);
 
-                selected_url
+                Ok(selected_url)
             }
         };
 
@@ -538,10 +550,29 @@ impl Router {
         for (name, value) in copy_request_headers(req) {
             request_builder = request_builder.header(name, value);
         }
-
+        if let Router::CacheAware { running_queue, .. } = self {
+            if let Ok(mut queue) = running_queue.lock() {
+                if let Some(count) = queue.get_mut(worker_url) {
+                *count += 1;
+                debug!("add count to {}",  worker_url);
+                } else {
+                error!("Key {} not found in running_queue", worker_url);
+                }
+            }
+        }
         let res = match request_builder.send().await {
             Ok(res) => res,
-            Err(_) => return HttpResponse::InternalServerError().finish(),
+            Err(_) => {
+                // Then decrement running queue counter if using CacheAware
+                if let Router::CacheAware { running_queue, .. } = self {
+                if let Ok(mut queue) = running_queue.lock() {
+                    if let Some(count) = queue.get_mut(worker_url) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
+                }
+                return HttpResponse::InternalServerError().finish()
+            }
         };
 
         let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
@@ -556,7 +587,6 @@ impl Router {
                     HttpResponse::InternalServerError().body(error_msg)
                 }
             };
-
             // Then decrement running queue counter if using CacheAware
             if let Router::CacheAware { running_queue, .. } = self {
                 if let Ok(mut queue) = running_queue.lock() {
@@ -567,30 +597,35 @@ impl Router {
             }
 
             response
-        } else if let Router::CacheAware { running_queue, .. } = self {
-            let running_queue = Arc::clone(running_queue);
-            let worker_url = worker_url.to_string();
-
+        } else if let Router::CacheAware {running_queue, .. } = self {
+            let running_queue1 = Arc::clone(running_queue);
+            let running_queue2 = Arc::clone(running_queue);
+            let worker_url1 = worker_url.to_string();
+            let worker_url2 = worker_url1.clone();
             HttpResponse::build(status)
                 .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
                 .streaming(
                     res.bytes_stream()
-                        .map_err(|_| {
+                        .map_err(move |_| {
+                            if let Ok(mut queue) = running_queue1.lock() {
+                                if let Some(count) = queue.get_mut(&worker_url1) {
+                                    *count = count.saturating_sub(1);
+                                }
+                            }
                             actix_web::error::ErrorInternalServerError("Failed to read stream")
                         })
-                        .inspect(move |bytes| {
-                            let bytes = bytes.as_ref().unwrap();
-                            if bytes
-                                .as_ref()
-                                .windows(12)
-                                .any(|window| window == b"data: [DONE]")
-                            {
-                                let mut locked_queue = running_queue.lock().unwrap();
-                                let count = locked_queue.get_mut(&worker_url).unwrap();
-                                *count = count.saturating_sub(1);
-                                debug!("Streaming is done!!")
+                        .chain(futures_util::stream::once(async move {
+                            if let Ok(mut queue) = running_queue2.lock() {
+                                if let Some(count) = queue.get_mut(&worker_url2) {
+                                    *count = count.saturating_sub(1);
+                                } else {
+                                    error!("failed to countdown {}", worker_url2)
+                                }
+                            } else {
+                                error!("failed to get lock {}", worker_url2)
                             }
-                        }),
+                            Ok(Bytes::new())
+                       }))
                 )
         } else {
             HttpResponse::build(status)
@@ -611,9 +646,11 @@ impl Router {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
         let mut total_retries = 0;
-
         while total_retries < MAX_TOTAL_RETRIES {
-            let worker_url = self.select_generate_worker(body, route);
+            let worker_url = match self.select_generate_worker(body, route) {
+                Ok(worker_url) => worker_url,
+                Err(_) => return HttpResponse::InternalServerError().finish(),
+            };
             let mut request_retries = 0;
 
             // Try the same worker multiple times
@@ -628,6 +665,7 @@ impl Router {
                 if response.status().is_success() {
                     return response;
                 } else {
+                    info!("failed to response {}", worker_url);
                     // if the worker is healthy, it means the request is bad, so return the error response
                     let health_response =
                         self.send_request(client, &worker_url, "/health", req).await;
