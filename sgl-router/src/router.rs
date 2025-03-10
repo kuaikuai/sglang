@@ -2,7 +2,7 @@ use crate::tree::Tree;
 use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 use actix_web::{HttpRequest, HttpResponse};
 use bytes::Bytes;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use tokio;
+use futures_util::Stream;
+use std::pin::Pin;
+use futures_util::task::Context;
+use futures_util::task::Poll;
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
@@ -131,6 +135,43 @@ pub enum PolicyConfig {
         interval_secs: u64,
     },
 }
+
+struct StreamWrapper<S> {
+    inner: S,
+    drop_callback: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl<S> StreamWrapper<S> {
+    fn new(inner: S, drop_callback: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner,
+            drop_callback: Some(Box::new(drop_callback)),
+        }
+    }
+}
+
+impl<S> Stream for StreamWrapper<S>
+where
+    S: Stream<Item = Result<Bytes, actix_web::Error>> + Unpin,
+{
+    type Item = Result<Bytes, actix_web::Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for StreamWrapper<S> {
+    fn drop(&mut self) {
+        if let Some(callback) = self.drop_callback.take() {
+            callback();
+        }
+    }
+}
+
 
 impl Router {
     pub fn new(worker_urls: Vec<String>, policy_config: PolicyConfig) -> Result<Self, String> {
@@ -481,11 +522,12 @@ impl Router {
                 // Load is considered imbalanced if:
                 // 1. (max - min) > abs_threshold AND
                 // 2. max > rel_threshold * min
+                let is_low = max_load < *balance_abs_threshold as usize && min_load < *balance_abs_threshold as usize;
                 let is_imbalanced = max_load.saturating_sub(min_load) > *balance_abs_threshold
-                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold) || ( max_load > 0 && min_load == 0 );
+                    && (max_load as f32) > (min_load as f32 * balance_rel_threshold) || is_low;
 
                 let selected_url = if is_imbalanced {
-                    if !( max_load > 0 && min_load == 0 ) {
+                    if !is_low {
                         // Log load balancing trigger and current queue state
                         info!(
                             "Load balancing triggered due to workload imbalance:\n\
@@ -553,10 +595,10 @@ impl Router {
         if let Router::CacheAware { running_queue, .. } = self {
             if let Ok(mut queue) = running_queue.lock() {
                 if let Some(count) = queue.get_mut(worker_url) {
-                *count += 1;
-                debug!("add count to {}",  worker_url);
+                    *count += 1;
+                    debug!("add count to {}",  worker_url);
                 } else {
-                error!("Key {} not found in running_queue", worker_url);
+                    error!("Key {} not found in running_queue", worker_url);
                 }
             }
         }
@@ -565,11 +607,11 @@ impl Router {
             Err(_) => {
                 // Then decrement running queue counter if using CacheAware
                 if let Router::CacheAware { running_queue, .. } = self {
-                if let Ok(mut queue) = running_queue.lock() {
-                    if let Some(count) = queue.get_mut(worker_url) {
-                        *count = count.saturating_sub(1);
+                    if let Ok(mut queue) = running_queue.lock() {
+                        if let Some(count) = queue.get_mut(worker_url) {
+                            *count = count.saturating_sub(1);
+                        }
                     }
-                }
                 }
                 return HttpResponse::InternalServerError().finish()
             }
@@ -598,35 +640,31 @@ impl Router {
 
             response
         } else if let Router::CacheAware {running_queue, .. } = self {
-            let running_queue1 = Arc::clone(running_queue);
-            let running_queue2 = Arc::clone(running_queue);
-            let worker_url1 = worker_url.to_string();
-            let worker_url2 = worker_url1.clone();
-            HttpResponse::build(status)
+            let running_queue = Arc::clone(&running_queue);
+            let worker_url = worker_url.to_string();
+            let running_queue_err = Arc::clone(&running_queue);
+            let worker_url_err = worker_url.clone();
+            let bytes_stream = res.bytes_stream()
+                .map_err(move |_| {
+                    if let Ok(mut queue) = running_queue_err.lock() {
+                        if let Some(count) = queue.get_mut(&worker_url_err) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                    actix_web::error::ErrorInternalServerError("failed to red stream")
+                });
+
+            let wrapped_stream = StreamWrapper::new(bytes_stream, move || {
+                let mut locked_queue = running_queue.lock().unwrap();
+                if let Some(count) = locked_queue.get_mut(&worker_url) {
+                    *count = count.saturating_sub(1);
+                    debug!("drop stream {}", worker_url);
+                }
+            });
+
+            HttpResponse::build(actix_web::http::StatusCode::OK)
                 .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
-                .streaming(
-                    res.bytes_stream()
-                        .map_err(move |_| {
-                            if let Ok(mut queue) = running_queue1.lock() {
-                                if let Some(count) = queue.get_mut(&worker_url1) {
-                                    *count = count.saturating_sub(1);
-                                }
-                            }
-                            actix_web::error::ErrorInternalServerError("Failed to read stream")
-                        })
-                        .chain(futures_util::stream::once(async move {
-                            if let Ok(mut queue) = running_queue2.lock() {
-                                if let Some(count) = queue.get_mut(&worker_url2) {
-                                    *count = count.saturating_sub(1);
-                                } else {
-                                    error!("failed to countdown {}", worker_url2)
-                                }
-                            } else {
-                                error!("failed to get lock {}", worker_url2)
-                            }
-                            Ok(Bytes::new())
-                       }))
-                )
+                .streaming(wrapped_stream)
         } else {
             HttpResponse::build(status)
                 .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
