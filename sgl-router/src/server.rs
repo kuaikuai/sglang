@@ -359,11 +359,11 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         )
         .init();
 
-    info!("� Initializing router on {}:{}", config.host, config.port);
-    info!("� Initializing workers on {:?}", config.worker_urls);
-    info!("� Policy Config: {:?}", config.policy_config);
+    info!("🚧 Initializing router on {}:{}", config.host, config.port);
+    info!("🚧 Initializing workers on {:?}", config.worker_urls);
+    info!("🚧 Policy Config: {:?}", config.policy_config);
     info!(
-        "� Max payload size: {} MB",
+        "🚧 Max payload size: {} MB",
         config.max_payload_size / (1024 * 1024)
     );
 
