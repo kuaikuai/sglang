@@ -22,6 +22,11 @@ struct ChatCompletionRequest {
     max_tokens: Option<u32>,      // Optional, default is infinity
     presence_penalty: Option<f32>, // Optional, default is 0
     frequency_penalty: Option<f32>, // Optional, default is 0
+    user: Option<String>,
+    seed: Option<u32>,
+    logit_bias: Option<HashMap<String, f32>>,
+    logprobs: bool,
+    top_logprobs: Option<i32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -354,11 +359,11 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         )
         .init();
 
-    info!("🚧 Initializing router on {}:{}", config.host, config.port);
-    info!("🚧 Initializing workers on {:?}", config.worker_urls);
-    info!("🚧 Policy Config: {:?}", config.policy_config);
+    info!("� Initializing router on {}:{}", config.host, config.port);
+    info!("� Initializing workers on {:?}", config.worker_urls);
+    info!("� Policy Config: {:?}", config.policy_config);
     info!(
-        "🚧 Max payload size: {} MB",
+        "� Max payload size: {} MB",
         config.max_payload_size / (1024 * 1024)
     );
 
