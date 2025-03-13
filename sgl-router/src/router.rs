@@ -393,6 +393,7 @@ impl Router {
     ) -> HttpResponse {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
+        const BASE_RETRY_DELAY_MS: u64 = 200;
         let mut total_retries = 0;
 
         while total_retries < MAX_TOTAL_RETRIES {
@@ -428,8 +429,10 @@ impl Router {
 
                         request_retries += 1;
                         total_retries += 1;
-
-                        if request_retries == MAX_REQUEST_RETRIES {
+                        if request_retries < MAX_REQUEST_RETRIES {
+                            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(request_retries);
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        } else {
                             warn!("Removing failed worker: {}", worker_url);
                             self.remove_worker(&worker_url);
                             break;
