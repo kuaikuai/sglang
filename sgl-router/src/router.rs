@@ -538,11 +538,15 @@ impl Router {
                     }
 
                     // Use shortest queue routing when load is imbalanced
-                    running_queue
+                    let url = running_queue
                         .iter()
                         .min_by_key(|(_url, &count)| count)
                         .map(|(url, _)| url.clone())
-                        .unwrap_or_else(|| worker_urls.read().unwrap()[0].clone())
+                        .or_else(|| worker_urls.read().unwrap().first().cloned());
+                    match url {
+                        Some(u) => u,
+                        None => "".to_string()
+                    }
                 } else {
                     // Use cache-aware routing when load is balanced
                     let (matched_text, matched_worker) = tree.prefix_match(&text);
@@ -555,7 +559,6 @@ impl Router {
                         tree.get_smallest_tenant()
                     }
                 };
-
                 // Update queues and tree
                 let  mut processed_queue = processed_queue.lock().unwrap();
                 if let Some(count) = processed_queue.get_mut(&selected_url) {
