@@ -25,7 +25,7 @@ struct ChatCompletionRequest {
     user: Option<String>,
     seed: Option<u32>,
     logit_bias: Option<HashMap<String, f32>>,
-    logprobs: bool,
+    logprobs: Option<bool>,
     top_logprobs: Option<i32>,
 }
 
