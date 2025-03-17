@@ -6,7 +6,8 @@ use env_logger::Builder;
 use log::{info, LevelFilter};
 use std::collections::HashMap;
 use std::io::Write;
-
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -44,6 +45,7 @@ struct Message {
 
 #[derive(Debug)]
 pub struct AppState {
+    all_workers: Arc<RwLock<Vec<String>>>,
     router: Router,
     client: reqwest::Client,
 }
@@ -55,8 +57,9 @@ impl AppState {
         policy_config: PolicyConfig,
     ) -> Result<Self, String> {
         // Create router based on policy
+        let all_workers = Arc::new(RwLock::new(worker_urls.clone()));
         let router = Router::new(worker_urls, policy_config)?;
-        Ok(Self { router, client })
+        Ok(Self { all_workers, router, client })
     }
 }
 
@@ -284,12 +287,89 @@ async fn v1_chat_completions(
         .await
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Prompt {
+    IntArray(Vec<i32>),
+    IntArray2D(Vec<Vec<i32>>),
+    SingleString(String),
+    StringArray(Vec<String>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Stop {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamOptions {
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CompletionRequest {
+    model: String,
+    prompt: Prompt,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_of: Option<i32>,
+    #[serde(default)]
+    echo: bool,
+    #[serde(default)]
+    frequency_penalty: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logit_bias: Option<HashMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<i32>,
+    #[serde(default = "default_max_tokens")]
+    max_tokens: i32,
+    #[serde(default = "default_n")]
+    n: i32,
+    #[serde(default)]
+    presence_penalty: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Stop>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix: Option<String>,
+    #[serde(default = "default_temperature")]
+    temperature: f64,
+    #[serde(default = "default_top_p")]
+    top_p: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+}
+
+fn default_max_tokens() -> i32 { 16 }
+fn default_n() -> i32 { 1 }
+fn default_temperature() -> f64 { 1.0 }
+fn default_top_p() -> f64 { 1.0 }
+
 #[post("/v1/completions")]
 async fn v1_completions(
     req: HttpRequest,
     body: Bytes,
     data: web::Data<AppState>,
 ) -> impl Responder {
+    // Parse the request body into a CompletionRequest struct
+    let _request: CompletionRequest = match serde_json::from_slice(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": {
+                    "message": format!("Invalid request body: {}", e),
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": null
+                }
+            }));
+        }
+    };
     data.router
         .route_generate_request(&data.client, &req, &body, "/v1/completions")
         .await
@@ -309,7 +389,11 @@ async fn add_worker(
     };
 
     match data.router.add_worker(&worker_url).await {
-        Ok(message) => HttpResponse::Ok().body(message),
+        Ok(message) =>
+        {
+            data.all_workers.write().unwrap().push(worker_url);
+            HttpResponse::Ok().body(message)
+        }
         Err(error) => HttpResponse::BadRequest().body(error),
     }
 }
@@ -324,6 +408,7 @@ async fn remove_worker(
         None => return HttpResponse::BadRequest().finish(),
     };
     data.router.remove_worker(&worker_url);
+    data.all_workers.write().unwrap().retain(|x| x != &worker_url);
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
@@ -383,6 +468,32 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     info!("✅ Serving router on {}:{}", config.host, config.port);
     info!("✅ Serving workers on {:?}", config.worker_urls);
 
+    let app_state_clone = app_state.clone();
+    tokio::spawn(async move {
+    let client = reqwest::Client::new();
+    loop {
+        let workers: Vec<String> = {
+            let all_workers = app_state_clone.all_workers.read().unwrap();
+            all_workers.clone()
+        };
+        for worker in workers.iter() {
+            let url = format!("{}/health", worker);
+            match client.get(&url).timeout(Duration::from_secs(5)).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let _ = app_state_clone.router.add_worker(worker).await;
+                    } else {
+                        log::error!("Health check failed for {}: Status {}", worker, response.status());
+                    }
+                }
+                Err(e) => {
+                    log::error!("Error checking worker health ({}): {}", worker, e);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+    });
     HttpServer::new(move || {
         App::new()
             .app_data(app_state.clone())
